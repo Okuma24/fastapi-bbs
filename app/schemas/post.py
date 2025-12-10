@@ -10,7 +10,7 @@ class PostBase(BaseModel):
 # 新規作成用（id や created_at は不要）
 class PostCreate(PostBase):
     post_number:int
-    pass
+    
 
 # レスポンス用（id, created_at が追加）
 class PostResponse(PostBase):
@@ -18,4 +18,4 @@ class PostResponse(PostBase):
     thread_id: int
     post_number: int
     created_at: datetime
-    
+    attachment: str | None = None
