@@ -1,38 +1,165 @@
 
-from fastapi import APIRouter,Depends, HTTPException, Request
+# =====================
+# Standard Library
+# =====================
+import os
+
+# =====================
+# Third Party
+# =====================
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Form,
+    File,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+
+from sqlalchemy import (
+    select,
+    insert,
+    func,
+    case,
+    distinct,
+    or_,
+)
+from sqlalchemy.orm import Session, aliased
+
+from faker import Faker
+fake = Faker("ja_JP")
+
+# =====================
+# Local Application
+# =====================
+from app.database import get_db
 from app.models.thread import Thread
 from app.models.post import Post
-
 from app.schemas.thread import ThreadResponse, ThreadCreate
-from app.database import get_db
-from sqlalchemy.orm import Session
-from sqlalchemy import select, insert, func, case, distinct,or_
+from app.services.file_upload import save_image_file
 
 router = APIRouter(
     prefix="/threads",
     tags=["Threads"]
 )
 
-from fastapi import Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import aliased
-
 templates = Jinja2Templates(directory="app/templates")
+
+# -----------------------
+# 検索機能 GET /search
+# -----------------------
+@router.get("/search")
+async def search_threads(
+    request: Request,
+    keyword: str, #　検索キーワード
+    page: int = 1,
+    db: Session = Depends(get_db)
+):
+
+    limit = 20
+
+    offset = (page - 1) * limit
+    like_word = f"%{keyword}%"  #　検索キーワードを前後方一致で設定
+
+    # スレッドでの一致
+    hit_title = case(
+        (Thread.title.like(like_word), 1),
+        else_=0
+    ).label("hit_title")
+
+    # 投稿での一致
+    hit_post = case(
+        (
+            select(1)
+            .select_from(Post)
+            .where(
+                Post.thread_id == Thread.id,
+                Post.content.like(like_word)
+            )
+            .exists(),
+            1
+        ),
+        else_=0
+    ).label("hit_post")
+
+    stmt = (
+        select(
+            Thread,
+            hit_title,
+            hit_post
+        )
+        .where(
+            or_(
+                Thread.title.like(like_word),
+                select(1)
+                .select_from(Post)
+                .where(
+                    Post.thread_id == Thread.id,
+                    Post.content.like(like_word)
+                )
+                .exists()
+            )
+        )
+        .order_by(Thread.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
+
+    results = db.execute(stmt).all()
+
+    # ---------------------------
+    # ② 件数カウント（ページ数計算用）
+    # ---------------------------
+    stmt_count = (
+        select(func.count(distinct(Thread.id)))
+        .outerjoin(Post, Post.thread_id == Thread.id)
+        .where( # 抽出条件
+            or_(    # OR で検索
+                Thread.title.like(like_word),   # タイトルで一致
+                Post.content.like(like_word)    # 投稿で一致
+            )
+        )
+    )
+
+    total_threads = db.execute(stmt_count).scalar_one()
+    total_pages = (total_threads + limit - 1) // limit
+
+    return templates.TemplateResponse(
+        "search_result.html",
+        {
+            "request": request,
+            "results": results, # 一致したスレッドデータ
+            "keyword": keyword, # 検索キーワード
+            "page": page,       # 現在のページ番号
+            "total_pages": total_pages, # 総ページ番号
+        }
+    )
+
+
 # -----------------------------------
 # フロント側処理 詳細
 # -----------------------------------
 @router.get("/{thread_id}/view", response_class=HTMLResponse)
 async def threads_detail_page(
-    request: Request, 
+    request: Request,
     thread_id: int,
-    page:int=1 , 
-    db:Session = Depends(get_db)
+    page: int = 1,
+    post: int | None = None,
+    db: Session = Depends(get_db),
 ):
     limit = 10
+
+    # 特定の投稿番号が含まれるページを表示する
+    if post is not None:
+        page = ((post - 1) // limit) + 1
+
     offset = (page - 1) * limit
-    
- # ───────────────
+
+    # ───────────────
     # ① Thread を取得
     # ───────────────
     thread = db.execute(
@@ -117,146 +244,6 @@ async def threads_detail_page(
 
 
 # -----------------------------------
-# フロント側処理 スレッドの新規作成画面を表示
-# -----------------------------------
-@router.get("/new", response_class=HTMLResponse)
-async def new_thread_page(request: Request):
-    return templates.TemplateResponse("new_thread.html", {"request": request})
-
-
-# -----------------------------------
-# フロント側処理 スレッドの新規作成
-# -----------------------------------
-from fastapi import Form, File, UploadFile, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy import insert, select
-from sqlalchemy.orm import Session
-from app.models.thread import Thread
-from app.models.post import Post
-from app.database import get_db
-import os
-
-UPLOAD_DIR = "app/static/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-@router.post("/create")
-async def create_thread_front(
-    request: Request,
-    title: str = Form(...),
-    author: str = Form(""),
-    content: str = Form(...),
-    image: UploadFile | None = File(None),
-    db: Session = Depends(get_db)):
-
-    # (1) Thread 作成
-    stmt = insert(Thread).values(title=title)
-    result = db.execute(stmt)
-    db.commit()
-    new_thread_id = result.lastrowid
-
-    # (1.5)添付ファイル処理
-    attachment_filename = None
-    if image and image.filename:
-        # ファイル名の決定
-        _,ext = os.path.splitext(image.filename)
-        filename = f"thread{new_thread_id}_post1{ext}"
-        save_path = os.path.join(UPLOAD_DIR,filename)
-
-        # 保存
-        with open(save_path,"wb") as f:
-            f.write(await image.read())
-        attachment_filename = filename
-
-
-    # (2) Post（本文）作成
-    values = {
-        "thread_id": new_thread_id,
-        "content": content,
-        "post_number":1,
-    }
-
-    # author 空欄なら DEFAULT '名無しさん' を使う
-    if author.strip():
-        values["author"] = author
-
-    # 添付ファイルがあれば追加
-    if attachment_filename:
-        values["attachment"] = attachment_filename
-
-    db.execute(insert(Post).values(values))
-    db.commit()
-
-    # (3) スレッド詳細へリダイレクト
-    return RedirectResponse(
-        url=f"/threads/{new_thread_id}/view",
-        status_code=303
-    )
-
-
-
-# -----------------------------------
-# フロント側処理 一覧
-# -----------------------------------
-@router.get("/list", response_class=HTMLResponse)
-async def list_threads_page(
-    request: Request,
-    page: int = 1,
-    db: Session = Depends(get_db)
-):
-    limit = 20  # 1ページあたりの件数
-    offset = (page - 1) * limit
-
-    # -----------------------------------
-    # ① スレッド一覧（ページネーション付き）
-    # -----------------------------------
-    stmt_threads = (
-        select(Thread)
-        .order_by(Thread.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    threads = db.execute(stmt_threads).scalars().all()
-
-    # -----------------------------------
-    # ② スレッド総数を取得 → ページ数算出
-    # -----------------------------------
-    stmt_count = select(func.count()).select_from(Thread)
-    total_threads = db.execute(stmt_count).scalar_one()
-    total_pages = (total_threads + limit - 1) // limit
-
-
-    # --- 最新投稿10件を取得（ThreadとJOIN） ---
-    stmt_posts = (
-        select(
-            Post.id,
-            Post.content,
-            Post.author,
-            Post.created_at,
-            Post.attachment,
-            Post.post_number,
-            Thread.title.label("thread_title"),
-            Thread.id.label("thread_id")
-        )
-        .join(Thread, Thread.id == Post.thread_id)
-        .order_by(Post.created_at.desc())
-        .limit(10)
-    )
-
-    latest_posts = db.execute(stmt_posts).all()
-
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "threads": threads,
-            "latest_posts": latest_posts,
-            "page": page,
-            "total_pages": total_pages,
-        }
-    )
-
-
-# -----------------------------------
 # スレッド詳細（検索モード）
 # GET /threads/{thread_id}/view/{keyword}
 # -----------------------------------
@@ -329,10 +316,153 @@ async def thread_detail_search(
         }
     )
 
+
+
+# -----------------------------------
+# フロント側処理 スレッドの新規作成画面を表示
+# -----------------------------------
+@router.get("/new", response_class=HTMLResponse)
+async def new_thread_page(request: Request):
+    return templates.TemplateResponse("new_thread.html", {"request": request})
+
+
+# -----------------------------------
+# フロント側処理 スレッドの新規作成
+# -----------------------------------
+UPLOAD_DIR = "app/static/uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+@router.post("/create")
+async def create_thread_front(
+    request: Request,
+    title: str = Form(...),
+    author: str = Form(""),
+    content: str = Form(...),
+    image: UploadFile | None = File(None),
+    db: Session = Depends(get_db)):
+
+    # (1) Thread 作成
+    stmt = insert(Thread).values(title=title)
+    result = db.execute(stmt)
+    db.commit()
+    new_thread_id = result.lastrowid
+
+    # (1.5)添付ファイル処理　servicesに共通化した
+    attachment_filename = None
+
+    if image and image.filename:
+        _, ext = os.path.splitext(image.filename)
+        attachment_filename = await save_image_file(
+            image=image,
+            filename=f"thread{new_thread_id}_post1{ext}"
+        )
+
+
+    # (2) Post（本文）作成
+    values = {
+        "thread_id": new_thread_id,
+        "content": content,
+        "post_number":1,
+    }
+
+    # author 空欄なら DEFAULT '名無しさん' を使う
+    if author.strip():
+        values["author"] = author
+
+    # 添付ファイルがあれば追加
+    if attachment_filename:
+        values["attachment"] = attachment_filename
+
+    db.execute(insert(Post).values(values))
+    db.commit()
+
+    # (3) スレッド詳細へリダイレクト
+    return RedirectResponse(
+        url=f"/threads/{new_thread_id}/view",
+        status_code=303
+    )
+
+
+
+# -----------------------------------
+# フロント側処理 一覧（ページネーション対応）
+# -----------------------------------
+@router.get("/list", response_class=HTMLResponse)
+async def list_threads_page(
+    request: Request, 
+    page: int = 1, 
+    db: Session = Depends(get_db)
+):
+
+    limit = 20  # 1ページあたりの件数
+    offset = (page - 1) * limit
+
+    # -----------------------------------
+    # ① スレッド一覧（ページネーション付き）
+    # -----------------------------------
+    stmt_threads = (
+        select(Thread)
+        .order_by(Thread.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    threads = db.execute(stmt_threads).scalars().all()
+
+    # -----------------------------------
+    # ② スレッド総数を取得 → ページ数算出
+    # -----------------------------------
+    stmt_count = select(func.count()).select_from(Thread)
+    total_threads = db.execute(stmt_count).scalar_one()
+    total_pages = (total_threads + limit - 1) // limit
+
+    # -----------------------------------
+    # ③ 最新投稿10件（これはそのまま）
+    # -----------------------------------
+    stmt_posts = (
+        select(
+            Post.id,
+            Post.content,
+            Post.author,
+            Post.created_at,
+            Post.attachment,
+            Post.post_number,
+            Thread.title.label("thread_title"),
+            Thread.id.label("thread_id"),
+        )
+        .join(Thread, Thread.id == Post.thread_id)
+        .order_by(Post.created_at.desc())
+        .limit(10)
+    )
+    latest_posts = db.execute(stmt_posts).all()
+
+    # -----------------------------------
+    # ④ テンプレートへ渡す
+    # -----------------------------------
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "threads": threads,
+            "latest_posts": latest_posts,
+            "page": page,
+            "total_pages": total_pages,
+        }
+    )
+
+
+# -----------------------------------
+# スレッド一覧 GET /threads
+# -----------------------------------
+@router.get("/", response_model=list[ThreadResponse])
+async def list_threads(db: Session = Depends(get_db)):
+    stmt = select(Thread)
+    result = db.execute(stmt).scalars().all()
+    return result
+
 # -----------------------------------
 # スレッド詳細 GET /threads/{thread_id}
 # -----------------------------------
-@router.get("/{thread_id}/view/{keyword}", response_model=ThreadResponse)
+@router.get("/{thread_id}", response_model=ThreadResponse)
 async def get_thread(thread_id: int, db: Session = Depends(get_db)):
     stmt = select(Thread).where(Thread.id == thread_id)
     result = db.execute(stmt).scalar_one_or_none()
@@ -361,14 +491,10 @@ async def create_thread(thread: ThreadCreate,db: Session = Depends(get_db)):
     new_thread = db.execute(stmt2).scalar_one()
     return new_thread
 
-
 # -----------------------
 # ダミー投稿作成
 # POST /threads/gen_dummy_threads
 # -----------------------
-from faker import Faker
-fake = Faker("ja_JP")   # 日本語のデータを生成
-
 @router.post("/gen_dummy_threads")
 def generate_dummy_threads(
     count: int = 100,               # ← デフォルト100件
@@ -408,91 +534,3 @@ def generate_dummy_threads(
         "created_threads": len(created_ids),
         "thread_ids": created_ids
     }
-      
-
-# -----------------------
-# 検索機能 GET /search
-# -----------------------
-@router.get("/search")
-async def search_threads(
-    request: Request,
-    keyword: str, #　検索キーワード
-    page: int = 1,
-    db: Session = Depends(get_db)
-):
-    limit = 20
-    offset = (page - 1) * limit
-    like_word = f"%{keyword}%"  #　検索キーワードを前後方一致で設定
-
-    hit_title = case(
-        (Thread.title.like(like_word), 1),
-        else_=0
-    ).label("hit_title")
-
-    hit_post = case(
-        (
-            select(1)
-            .select_from(Post)
-            .where(
-                Post.thread_id == Thread.id,
-                Post.content.like(like_word)
-            )
-            .exists(),
-            1
-        ),
-        else_=0
-    ).label("hit_post")
-
-    stmt = (
-        select(
-            Thread,
-            hit_title,
-            hit_post
-        )
-        .where(
-            or_(
-                Thread.title.like(like_word),
-                select(1)
-                .select_from(Post)
-                .where(
-                    Post.thread_id == Thread.id,
-                    Post.content.like(like_word)
-                )
-                .exists()
-            )
-        )
-        .order_by(Thread.created_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-
-
-    results = db.execute(stmt).all()
-
-    # ---------------------------
-    # ② 件数カウント（ページ数計算用）
-    # ---------------------------
-    stmt_count = (
-        select(func.count(distinct(Thread.id)))
-        .outerjoin(Post, Post.thread_id == Thread.id)
-        .where( # 抽出条件
-            or_(    # OR で検索
-                Thread.title.like(like_word),   # タイトルで一致
-                Post.content.like(like_word)    # 投稿で一致
-            )
-        )
-    )
-
-    total_threads = db.execute(stmt_count).scalar_one()
-    total_pages = (total_threads + limit - 1) // limit
-
-    return templates.TemplateResponse(
-        "search_result.html",
-        {
-            "request": request,
-            "results": results, # 一致したスレッドデータ
-            "keyword": keyword, # 検索キーワード
-            "page": page,       # 現在のページ番号
-            "total_pages": total_pages, # 総ページ番号
-        }
-    )
